@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>囲碁サンドボックス</title>
+<style>
+  :root {
+    --bg: #f5f1e8; --fg: #2b2b2b; --muted: #6b6558; --panel: #fffdf8; --line: #d8d0bf;
+    --board: #dcb35c; --grid: #3a2a10; --accent: #c0392b; --lib: #2e86de;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; display: flex; gap: 20px; flex-wrap: wrap; }
+  #boardWrap { flex: 1 1 520px; max-width: 720px; }
+  svg { width: 100%; height: auto; display: block; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,.2); touch-action: manipulation; }
+  aside { flex: 1 1 280px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  h1 { font-size: 1.2rem; margin: 0 0 10px; }
+  h2 { font-size: .95rem; margin: 16px 0 6px; color: var(--muted); }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  button, select { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--fg); cursor: pointer; }
+  button.on { background: var(--fg); color: #fff; border-color: var(--fg); }
+  label { display: block; margin: 4px 0; }
+  #msg { min-height: 2.6em; margin-top: 10px; padding: 8px; border-radius: 6px; background: #f0ebe0; font-size: .92rem; }
+  #info { font-size: .92rem; line-height: 1.6; }
+  .help { font-size: .85rem; color: var(--muted); line-height: 1.6; padding-left: 1.1em; margin: 4px 0; }
+</style>
+</head>
+<body>
+<main>
+  <div id="boardWrap"><svg id="board"></svg></div>
+  <aside>
+    <h1>囲碁サンドボックス</h1>
+
+    <h2>置く石</h2>
+    <div class="row" id="modes">
+      <button data-mode="alt" class="on">交互</button>
+      <button data-mode="B">黒のみ</button>
+      <button data-mode="W">白のみ</button>
+      <button data-mode="erase">消しゴム</button>
+    </div>
+
+    <h2>盤</h2>
+    <div class="row">
+      <select id="size"><option>9</option><option>13</option><option>19</option></select>
+      <button id="undo">一手戻す</button>
+      <button id="clear">クリア</button>
+    </div>
+
+    <h2>ルール設定</h2>
+    <label><input type="checkbox" id="capture" checked> 石を取る（呼吸点0で除去）</label>
+    <label><input type="checkbox" id="noSuicide" checked> 自殺手を禁止</label>
+    <label><input type="checkbox" id="ko" checked> コウ（同形反復）を禁止</label>
+    <label><input type="checkbox" id="showLibs" checked> 全グループの呼吸点数を表示</label>
+
+    <div id="msg">盤をクリックして石を置いてみましょう。</div>
+
+    <h2>状況</h2>
+    <div id="info"></div>
+
+    <h2>使い方</h2>
+    <ul class="help">
+      <li>右クリックでその石を消せます（実験用）。</li>
+      <li>石にマウスを乗せると、その「グループ」と「呼吸点（ダメ）」が青い点で表示されます。</li>
+      <li>呼吸点が0になった相手の石は取られて盤から消えます。</li>
+      <li>「石を取る」をOFFにすると、取られる配置も自由に作れます。</li>
+    </ul>
+  </aside>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const svg = $('board');
+const NS = 'http://www.w3.org/2000/svg';
+const CELL = 40, PAD = 30;
+
+let N = 9, board, turn = 'B', mode = 'alt', history = [], captures = { B: 0, W: 0 }, hover = null;
+
+function reset(n) {
+  N = n;
+  board = Array.from({ length: N }, () => Array(N).fill(null));
+  history = []; captures = { B: 0, W: 0 }; turn = 'B'; hover = null;
+  setMsg('盤をクリックして石を置いてみましょう。');
+  render();
+}
+
+const other = c => c === 'B' ? 'W' : 'B';
+const name = c => c === 'B' ? '黒' : '白';
+const inside = (x, y) => x >= 0 && y >= 0 && x < N && y < N;
+const neighbors = (x, y) => [[x+1,y],[x-1,y],[x,y+1],[x,y-1]].filter(([a,b]) => inside(a,b));
+const cloneBoard = b => b.map(r => r.slice());
+const key = b => b.map(r => r.map(c => c || '.').join('')).join('/');
+
+// 連結した同色の石（グループ）と、その呼吸点を求める
+function groupAt(b, x, y) {
+  const color = b[y][x];
+  const stones = [], libs = new Set(), seen = new Set([x + ',' + y]);
+  const stack = [[x, y]];
+  while (stack.length) {
+    const [cx, cy] = stack.pop();
+    stones.push([cx, cy]);
+    for (const [nx, ny] of neighbors(cx, cy)) {
+      const v = b[ny][nx], k = nx + ',' + ny;
+      if (v === null) libs.add(k);
+      else if (v === color && !seen.has(k)) { seen.add(k); stack.push([nx, ny]); }
+    }
+  }
+  return { color, stones, libs };
+}
+
+function place(x, y, color) {
+  if (board[y][x]) { setMsg('そこには既に石があります。'); return; }
+  const b = cloneBoard(board);
+  b[y][x] = color;
+  let taken = [];
+
+  if ($('capture').checked) {
+    // 1. 隣接する相手グループで呼吸点0のものを取る
+    for (const [nx, ny] of neighbors(x, y)) {
+      if (b[ny][nx] === other(color)) {
+        const g = groupAt(b, nx, ny);
+        if (g.libs.size === 0) for (const [sx, sy] of g.stones) { if (b[sy][sx]) { b[sy][sx] = null; taken.push([sx, sy]); } }
+      }
+    }
+    // 2. 自分のグループの呼吸点が0なら自殺手
+    const own = groupAt(b, x, y);
+    if (own.libs.size === 0) {
+      if ($('noSuicide').checked) { setMsg(`✕ 自殺手です：${name(color)}を置くと自分の呼吸点が0になり、相手の石も取れません。`); return; }
+      for (const [sx, sy] of own.stones) b[sy][sx] = null;
+      captures[other(color)] += own.stones.length;
+      setMsg(`自殺手（許可中）：${name(color)}の石 ${own.stones.length} 個が自分で取られました。`);
+    }
+    // 3. コウ：直前の局面に戻る手は禁止
+    if ($('ko').checked && history.length && key(b) === history[history.length - 1].key) {
+      setMsg('✕ コウです：すぐに取り返すと同じ局面に戻るので、一度ほかに打つ必要があります。'); return;
+    }
+  }
+
+  history.push({ board: board, captures: { ...captures }, turn, key: key(board) });
+  board = b;
+  captures[color] += taken.length;
+  if (taken.length) setMsg(`● ${name(color)}が${name(other(color))}の石を ${taken.length} 個取りました！（呼吸点が0になったため）`);
+  else if (!(groupAt(b, x, y).libs.size === 0)) {
+    const g = groupAt(b, x, y);
+    const atari = neighbors(x, y).some(([nx, ny]) => b[ny][nx] === other(color) && groupAt(b, nx, ny).libs.size === 1);
+    setMsg(atari ? `アタリ！ ${name(other(color))}の石の呼吸点が残り1つです。` :
+      g.libs.size === 1 ? `注意：置いた${name(color)}のグループは呼吸点が1つ（アタリ）です。` :
+      `${name(color)}を置きました。このグループの呼吸点は ${g.libs.size}。`);
+  }
+  if (mode === 'alt') turn = other(color);
+  render();
+}
+
+function erase(x, y) {
+  if (!board[y][x]) return;
+  history.push({ board: board, captures: { ...captures }, turn, key: key(board) });
+  board = cloneBoard(board); board[y][x] = null;
+  setMsg('石を消しました。'); render();
+}
+
+function undo() {
+  const h = history.pop();
+  if (!h) return;
+  board = h.board; captures = h.captures; turn = h.turn;
+  setMsg('一手戻しました。'); render();
+}
+
+function setMsg(t) { $('msg').textContent = t; }
+
+function el(tag, attrs, parent = svg) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  parent.appendChild(e); return e;
+}
+
+function render() {
+  const S = PAD * 2 + CELL * (N - 1);
+  svg.setAttribute('viewBox', `0 0 ${S} ${S}`);
+  svg.innerHTML = '';
+  const P = i => PAD + i * CELL;
+  el('rect', { x: 0, y: 0, width: S, height: S, fill: 'var(--board)' });
+  for (let i = 0; i < N; i++) {
+    el('line', { x1: P(0), y1: P(i), x2: P(N-1), y2: P(i), stroke: 'var(--grid)', 'stroke-width': 1 });
+    el('line', { x1: P(i), y1: P(0), x2: P(i), y2: P(N-1), stroke: 'var(--grid)', 'stroke-width': 1 });
+  }
+  const stars = { 9: [2,6,4], 13: [3,9,6], 19: [3,9,15] }[N];
+  for (const a of stars) for (const b of stars)
+    if (N !== 9 || (a !== 4) === (b !== 4)) el('circle', { cx: P(a), cy: P(b), r: 3.5, fill: 'var(--grid)' });
+
+  // ホバー中のグループ
+  let hg = null;
+  if (hover && board[hover[1]][hover[0]]) hg = groupAt(board, hover[0], hover[1]);
+  const inHg = new Set(hg ? hg.stones.map(s => s + '') : []);
+
+  const labeled = new Set();
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const c = board[y][x];
+    if (!c) continue;
+    el('circle', { cx: P(x)+1.5, cy: P(y)+2, r: CELL*0.46, fill: 'rgba(0,0,0,.25)' });
+    el('circle', { cx: P(x), cy: P(y), r: CELL*0.46, fill: c === 'B' ? '#1b1b1b' : '#f8f8f4',
+      stroke: inHg.has([x,y]+'') ? 'var(--lib)' : (c === 'B' ? '#000' : '#999'), 'stroke-width': inHg.has([x,y]+'') ? 3 : 1 });
+    // 各グループの呼吸点数をグループ内の1つの石に表示
+    if ($('showLibs').checked && !labeled.has(x+','+y)) {
+      const g = groupAt(board, x, y);
+      g.stones.forEach(s => labeled.add(s + ''));
+      const t = el('text', { x: P(x), y: P(y)+5, 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700,
+        fill: g.libs.size === 1 ? 'var(--accent)' : (c === 'B' ? '#fff' : '#222') });
+      t.textContent = g.libs.size;
+    }
+  }
+  if (hg) for (const k of hg.libs) {
+    const [lx, ly] = k.split(',').map(Number);
+    el('circle', { cx: P(lx), cy: P(ly), r: 6, fill: 'var(--lib)', opacity: .85 });
+  }
+  // ゴースト石
+  if (hover && !board[hover[1]][hover[0]] && mode !== 'erase') {
+    const c = mode === 'alt' ? turn : mode;
+    el('circle', { cx: P(hover[0]), cy: P(hover[1]), r: CELL*0.46, fill: c === 'B' ? '#000' : '#fff', opacity: .4 });
+  }
+
+  const next = mode === 'alt' ? `次は <b>${name(turn)}</b>` : mode === 'erase' ? '消しゴムモード' : `<b>${name(mode)}</b>のみ配置`;
+  let infoHtml = `${next}<br>取った石：黒 ${captures.B} / 白 ${captures.W}`;
+  if (hg) infoHtml += `<br>選択中：${name(hg.color)}のグループ（石 ${hg.stones.length} 個・呼吸点 ${hg.libs.size}）`;
+  $('info').innerHTML = infoHtml;
+}
+
+function pointFromEvent(e) {
+  const r = svg.getBoundingClientRect();
+  const S = PAD * 2 + CELL * (N - 1);
+  const x = Math.round(((e.clientX - r.left) / r.width * S - PAD) / CELL);
+  const y = Math.round(((e.clientY - r.top) / r.height * S - PAD) / CELL);
+  return inside(x, y) ? [x, y] : null;
+}
+
+svg.addEventListener('click', e => {
+  const p = pointFromEvent(e); if (!p) return;
+  if (mode === 'erase') erase(...p);
+  else place(...p, mode === 'alt' ? turn : mode);
+});
+svg.addEventListener('contextmenu', e => { e.preventDefault(); const p = pointFromEvent(e); if (p) erase(...p); });
+svg.addEventListener('mousemove', e => {
+  const p = pointFromEvent(e);
+  if (String(p) !== String(hover)) { hover = p; render(); }
+});
+svg.addEventListener('mouseleave', () => { hover = null; render(); });
+
+$('modes').addEventListener('click', e => {
+  const m = e.target.dataset.mode; if (!m) return;
+  mode = m;
+  for (const b of $('modes').children) b.classList.toggle('on', b.dataset.mode === m);
+  render();
+});
+$('size').addEventListener('change', e => reset(+e.target.value));
+$('undo').addEventListener('click', undo);
+$('clear').addEventListener('click', () => reset(N));
+$('showLibs').addEventListener('change', render);
+document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); } });
+
+reset(9);
+</script>
+</body>
+</html>
